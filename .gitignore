@@ -1,0 +1,8 @@
+local_render_trial.py
+.venv
+out_local
+*.pptx
+*.aws*
+*.slides*
+customize_deck.py
+*render*.sh

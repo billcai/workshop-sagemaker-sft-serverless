@@ -1,0 +1,212 @@
+{
+  "theme": "light",
+  "slides": [
+    {
+      "layout": "Title Slide 2A",
+      "placeholders": {
+        "Title 1": "Fine-Tuning Qwen3-4B",
+        "Subtitle 2": "Phishing detection with SageMaker Serverless SFT",
+        "Text Placeholder 7": "GovTech Anti-Scam Team · hands-on workshop"
+      }
+    },
+    {
+      "layout": "Agenda Slide 1",
+      "placeholders": {
+        "Title 1": "What we'll do today",
+        "Text Placeholder 6": [
+          "Concepts — SFT, LoRA, and what \"serverless training\" means here",
+          "Fine-tune — LoRA on Qwen3-4B with the SageMaker SDK (nb 01)",
+          "Evaluate — Custom Scorer baseline vs fine-tuned (nb 03 / 04)",
+          "Results — the lift, and the reasoning-model scoring trap",
+          "Take-home — vision variant + Bedrock serverless deploy"
+        ]
+      }
+    },
+    {
+      "layout": "Title and Bulleted Content",
+      "placeholders": {
+        "Title 1": "Why fine-tune a small model for this?",
+        "Content Placeholder 2": [
+          "Phishing/scam detection is high-volume and latency-sensitive — you classify millions of pages, not chat with one",
+          "A generic frontier LLM is overkill, expensive per call, and not specialized to your label space",
+          "A 4B model LoRA-tuned on ~1.8k examples becomes a fast, cheap, specialized classifier you own",
+          "Single-token output (phish / benign) → trivial to evaluate exactly: accuracy = pred == truth",
+          "Easy to extend later: brand-target prediction, reasoning chains, JSON output"
+        ]
+      }
+    },
+    {
+      "layout": "Blank",
+      "placeholders": {}
+    },
+    {
+      "layout": "Three column with subheadings",
+      "placeholders": {
+        "Title 1": "Three concepts before we start",
+        "Text Placeholder 2": "SFT",
+        "Content Placeholder 3": ["Supervised Fine-Tuning", "Show the model labeled prompt → completion pairs and adjust weights to match", "Here: page summary → 'phish' / 'benign'"],
+        "3": "LoRA",
+        "4": ["Low-Rank Adaptation", "Train small adapter matrices, freeze the base weights", "Faster, cheaper, ~MBs not GBs — and CMI can merge it back"],
+        "10": "\"Serverless\" training",
+        "11": ["No instance type, count, or fleet to pick", "SageMaker provisions the GPUs; you pay wallclock", "SFTTrainer never asks for compute settings"]
+      }
+    },
+    {
+      "layout": "Comparison",
+      "placeholders": {
+        "Title 1": "Why Qwen3-4B?",
+        "Text Placeholder 2": "What makes it a good fit",
+        "Content Placeholder 3": [
+          "Small enough to LoRA-tune end-to-end inside a ~75-min session",
+          "Capable enough that 1 epoch on 1.8k examples visibly lifts the classifier",
+          "In JumpStart as huggingface-reasoning-qwen3-4b — supports SFT/DPO/RLAIF/RLVR",
+          "Has a sibling VLM (qwen3-5-4b) → natural 'now try vision' stretch"
+        ],
+        "Text Placeholder 4": "Things to know",
+        "Content Placeholder 5": [
+          "It's a reasoning model — emits <think>…</think>, which bites the scorer (slide 15)",
+          "Bedrock CMI supports only Qwen3ForCausalLM — our SFT output qualifies",
+          "No Converse API for Qwen3 → use InvokeModel",
+          "Qwen license applies — you accept the EULA before training"
+        ]
+      }
+    },
+    {
+      "layout": "Section Header Option 1",
+      "placeholders": { "Title 1": "1 · The Dataset" }
+    },
+    {
+      "layout": "Code",
+      "placeholders": {
+        "Title 1": "PhreshPhish → prompt / completion JSONL",
+        "Content Placeholder 2": "# 666k labeled phishing/benign HTML+URL pairs (36.6 GB), streamed — never downloaded whole.\n# Prep sliced 1k phish + 1k benign into a public HF dataset: gt2026workshop/phreshphish-2k\n\nfrom datasets import load_dataset\nds = load_dataset(\"gt2026workshop/phreshphish-2k\", name=\"text\")\n\nds[\"train\"][0]\n# {\n#   \"prompt\":     \"You are a phishing detector. URL: ... Title: ... Forms: ... Visible text: ...\",\n#   \"completion\": \"phish\",          # <- single token, label-only on purpose\n#   \"label\": \"phish\", \"target_brand\": \"paypal\", \"sha256\": \"...\"\n# }\n\n# SFTTrainer wants {\"prompt\":..., \"completion\":...} per line. Label-only → exact eval, fast."
+      }
+    },
+    {
+      "layout": "Section Header Option 1",
+      "placeholders": { "Title 1": "2 · Fine-Tune — notebook 01" }
+    },
+    {
+      "layout": "Code",
+      "placeholders": {
+        "Title 1": "Stage the data into the AI Registry",
+        "Content Placeholder 2": "# 1. Upload the JSONL splits to S3 (default bucket: sagemaker-<region>-<acct>)\ns3.upload_file(\"train.jsonl\",      BUCKET, f\"{PREFIX}/data/train.jsonl\")\ns3.upload_file(\"validation.jsonl\", BUCKET, f\"{PREFIX}/data/validation.jsonl\")\n\n# 2. Register both splits with the SageMaker AI Registry\nfrom sagemaker.ai_registry.dataset import DataSet\ntrain_dataset = DataSet.create(name=\"phreshphish-workshop-text-train\", source=TRAIN_S3, wait=True)\nval_dataset   = DataSet.create(name=\"phreshphish-workshop-text-val\",   source=VAL_S3,   wait=True)\n\n# 3. The registry collection the fine-tuned adapter will land in\nfrom sagemaker.core.resources import ModelPackageGroup\nmpg = ModelPackageGroup.create(model_package_group_name=\"qwen3-4b-phish-sft\", ...)"
+      }
+    },
+    {
+      "layout": "Code",
+      "placeholders": {
+        "Title 1": "Configure & launch the SFT-LoRA job",
+        "Content Placeholder 2": "from sagemaker.train.sft_trainer import SFTTrainer\nfrom sagemaker.train.common import TrainingType\n\ntrainer = SFTTrainer(\n    model=\"huggingface-reasoning-qwen3-4b\",\n    training_type=TrainingType.LORA,         # adapter, not full FT\n    model_package_group=mpg,\n    training_dataset=train_dataset.arn,\n    validation_dataset=val_dataset.arn,\n    s3_output_path=S3_OUTPUT_PATH,\n    accept_eula=True,                        # Qwen3 license\n    mlflow_resource_arn=MLFLOW_RESOURCE_ARN, # None => no curves\n)   # no instance_type / count / fleet — compute is managed\n\ntraining_job = trainer.train(wait=True)      # ~20-30 min, to MLflow"
+      }
+    },
+    {
+      "layout": "Title and Bulleted Content",
+      "placeholders": {
+        "Title 1": "Watch it train — and the MLflow gotcha",
+        "Content Placeholder 2": [
+          "Live loss curves: Studio → Applications → MLflow → experiment qwen3-4b-phish-sft, run workshop-run-01",
+          "You'll see train_loss and eval_loss per step/epoch (also mirrored to TensorBoard in S3)",
+          "Gotcha: if MLFLOW_RESOURCE_ARN is None the SDK tries to auto-CREATE an app — but the account is capped at 3",
+          "At quota that create fails silently → no curves, and eval jobs can fail with a malformed-ARN error",
+          "Fix: auto-discover an existing app with list_mlflow_apps and pass its ARN (all notebooks do this)"
+        ]
+      }
+    },
+    {
+      "layout": "Section Header Option 1",
+      "placeholders": { "Title 1": "3 · Evaluate — notebooks 03 & 04" }
+    },
+    {
+      "layout": "Title and Bulleted Content",
+      "placeholders": {
+        "Title 1": "Custom Scorer: a tiny reward function",
+        "Content Placeholder 2": [
+          "Evaluator = a Lambda returning 1.0 when the model's label matches ground truth, else 0.0",
+          "nb 03 registers the eval dataset + reward fn once; scores the BASE model (no fine-tune needed)",
+          "So run nb 03 DURING the 20–30 min training wait — it's not dead time",
+          "nb 04 reuses the SAME dataset + scorer, evaluate_base_model=True → base + fine-tuned in one job",
+          "Lambda needs a role trusted by lambda.amazonaws.com (exec role works if Lambda-assumable)"
+        ]
+      }
+    },
+    {
+      "layout": "Blank",
+      "placeholders": {}
+    },
+    {
+      "layout": "Blank",
+      "placeholders": {}
+    },
+    {
+      "layout": "Title Only Gradient 1",
+      "placeholders": { "Title 1": "~81%  →  ~98%" }
+    },
+    {
+      "layout": "Blank",
+      "placeholders": {}
+    },
+    {
+      "layout": "Title and Bulleted Content",
+      "placeholders": {
+        "Title 1": "Cost & prerequisites",
+        "Content Placeholder 2": [
+          "Cost: ~$5–15 SFT-LoRA + ~$1–3 if you spin a real-time endpoint → ~$6–20 per attendee",
+          "Each attendee: a SageMaker AI domain + Studio, exec role with AmazonSageMakerModelCustomizationCoreAccess",
+          "Accept the Qwen3 EULA in JumpStart before the session",
+          "One MLflow app to reuse (cap is 3) — notebooks auto-discover it",
+          "A Lambda-assumable role for the reward fn (eval notebooks 03/04)",
+          "Bedrock Custom Model Import is BLOCKED in the shared account by an SCP → take-home only"
+        ]
+      }
+    },
+    {
+      "layout": "Section Header Option 1",
+      "placeholders": { "Title 1": "Stretch & Take-Home" }
+    },
+    {
+      "layout": "Title and Bulleted Content",
+      "placeholders": {
+        "Title 1": "Stretch: the vision variant (nb 02)",
+        "Content Placeholder 2": [
+          "Same task, different modality: LoRA-tune the VLM huggingface-vlm-qwen3-5-4b on rendered page screenshots",
+          "Rationale: a typosquatted PayPal page is obvious visually even when the HTML is obfuscated",
+          "Dataset is multimodal — messages with image + text content; images staged to S3 by S3 URI",
+          "Caveat: PhreshPhish stores HTML only. Re-rendering in 2026 is degraded — JS-disabled SPAs, offline assets",
+          "~70–80% of renders succeed; of those ~half look page-like. Enough to DEMONSTRATE SFT on a VLM, not for production"
+        ]
+      }
+    },
+    {
+      "layout": "Comparison",
+      "placeholders": {
+        "Title 1": "Take-home: Bedrock Custom Model Import (nb 05)",
+        "Text Placeholder 2": "SageMaker real-time endpoint (nb 01)",
+        "Content Placeholder 3": [
+          "Billed per-hour while the endpoint runs",
+          "You manage the endpoint lifecycle",
+          "Invoke: sagemaker-runtime.invoke_endpoint",
+          "Good for a fast in-session smoke test"
+        ],
+        "Text Placeholder 4": "Bedrock CMI (take-home, your own account)",
+        "Content Placeholder 5": [
+          "Per-token + per-copy on-demand; scales to zero",
+          "Fully managed — points at the SFT job's pre-merged hf_merged/ weights",
+          "Invoke: bedrock-runtime.invoke_model (no Converse for Qwen3)",
+          "Blocked in the workshop account (SCP) → run in us-east-1/2, us-west-2, or eu-central-1"
+        ]
+      }
+    },
+    {
+      "layout": "Thank You Option 1",
+      "placeholders": {
+        "10": "What to fine-tune next",
+        "11": "Brand-target prediction · reasoning chains · JSON output · the VLM variant",
+        "12": "Resources",
+        "13": "PhreshPhish card · SageMaker open-weight customization docs · Qwen3 model card",
+        "14": "Thank you",
+        "15": "GovTech Anti-Scam × AWS — questions?"
+      }
+    }
+  ]
+}
